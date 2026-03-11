@@ -1,5 +1,7 @@
 openai-agents
 openai-chatkit
+openai-guardrails
+python-dotenv
 pydantic
 fastapi
 uvicorn

@@ -5,6 +5,8 @@ import React from "react";
 
 type ChatKitPanelProps = {
   initialThreadId?: string | null;
+  instruction: string;
+  schema: string;
   onThreadChange?: (threadId: string | null) => void;
   onResponseEnd?: () => void;
   onRunnerUpdate?: () => void;
@@ -17,6 +19,8 @@ const CHATKIT_DOMAIN_KEY =
 
 export function ChatKitPanel({
   initialThreadId,
+  instruction,
+  schema,
   onThreadChange,
   onResponseEnd,
   onRunnerUpdate,
@@ -27,9 +31,35 @@ export function ChatKitPanel({
     api: {
       url: "/chatkit",
       domainKey: CHATKIT_DOMAIN_KEY,
+      fetch: async (input, init) => {
+        if (!init?.body || typeof init.body !== "string") {
+          return fetch(input, init);
+        }
+
+        let nextBody = init.body;
+        try {
+          const payload = JSON.parse(init.body);
+          payload.metadata = {
+            ...(payload.metadata ?? {}),
+            analysis_instruction: instruction,
+            analysis_schema: schema,
+          };
+          nextBody = JSON.stringify(payload);
+        } catch {
+          return fetch(input, init);
+        }
+
+        const headers = new Headers(init.headers);
+        headers.set("content-type", "application/json");
+        return fetch(input, {
+          ...init,
+          headers,
+          body: nextBody,
+        });
+      },
     },
     composer: {
-      placeholder: "Message...",
+      placeholder: "Ask an analytics question...",
     },
     history: {
       enabled: false,
@@ -47,17 +77,19 @@ export function ChatKitPanel({
     },
     initialThread: initialThreadId ?? null,
     startScreen: {
-      greeting: "Hi! I'm your airline assistant. How can I help today?",
+      greeting: "Ask about Aristino marketing performance, revenue, channels, stores, or products.",
       prompts: [
-        { label: "Change my seat", prompt: "Can you move me to seat 14C?" },
         {
-          label: "Flight status",
-          prompt: "What's the status of flight FLT-123?",
+          label: "Revenue by channel",
+          prompt: "Tong doanh thu theo transaction_source trong 30 ngay qua la gi?",
         },
         {
-          label: "Missed connection",
-          prompt:
-            "My flight from Paris to New York was delayed and I missed my connection to Austin. Also, my checked bag is missing and I need to spend the night in New York. Can you help me?",
+          label: "Top stores",
+          prompt: "Top 10 cua hang co doanh thu cao nhat thang nay la gi?",
+        },
+        {
+          label: "Product discount",
+          prompt: "Nhom san pham nao dang co tong discount cao nhat trong quy nay?",
         },
       ],
     },
@@ -89,7 +121,7 @@ export function ChatKitPanel({
     <div className="flex flex-col h-full flex-1 bg-white shadow-sm border border-gray-200 border-t-0 rounded-xl">
       <div className="bg-blue-600 text-white h-12 px-4 flex items-center rounded-t-xl">
         <h2 className="font-semibold text-sm sm:text-base lg:text-lg">
-          Customer View
+          Analytics Chat
         </h2>
       </div>
       <div className="flex-1 overflow-hidden pb-1.5">

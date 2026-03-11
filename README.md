@@ -4,11 +4,11 @@
 ![NextJS](https://img.shields.io/badge/Built_with-NextJS-blue)
 ![OpenAI API](https://img.shields.io/badge/Powered_by-OpenAI_API-orange)
 
-This repository contains a demo of a Customer Service interface built on top of the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/).
+This repository contains a ChatKit interface built on top of the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/).
 
 It is composed of two parts:
 
-1. A python backend that handles the agent orchestration logic, implementing the Agents SDK [customer service example](https://github.com/openai/openai-agents-python/tree/main/examples/customer_service)
+1. A python backend that handles the agent orchestration logic for an Aristino analytics assistant using the OpenAI Agents SDK and a hosted MCP tool
 
 2. A Next.js UI allowing the visualization of the agent orchestration process and providing a chat interface. It uses [ChatKit](https://openai.github.io/chatkit-js/) to provide a high-quality chat interface.
 
@@ -65,6 +65,36 @@ python -m uvicorn main:app --reload --port 8000
 ```
 
 The backend will be available at: [http://localhost:8000](http://localhost:8000)
+
+### Analytics workflow endpoint
+
+This repo now also exposes a standalone analytics workflow endpoint that wraps an Agents SDK agent with:
+
+- a hosted MCP tool for your analytics backend
+- moderation + prompt-injection guardrails
+- a dedicated FastAPI route separate from the airline demo
+
+Set the MCP connection through environment variables before calling it:
+
+```bash
+export ARISTINO_MCP_SERVER_URL="https://your-mcp-host/mcp"
+export ARISTINO_MCP_AUTHORIZATION="Basic <base64-credentials>"
+export ARISTINO_MCP_SERVER_LABEL="Dimension_Metrics_Identified"
+export ARISTINO_MCP_ALLOWED_TOOLS="read_query"
+```
+
+Then call:
+
+```bash
+curl -X POST http://localhost:8000/analytics/run \
+  -H "Content-Type: application/json" \
+  -d '{"input_as_text":"Tong doanh thu theo kenh trong 30 ngay qua la gi?"}'
+```
+
+The response returns:
+
+- `status: "completed"` with `output_text` when the workflow runs successfully
+- `status: "blocked"` with structured `guardrails` details when a tripwire is triggered
 
 #### Run the UI & backend simultaneously
 

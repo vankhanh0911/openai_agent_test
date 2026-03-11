@@ -21,6 +21,9 @@ export function Guardrails({ guardrails, inputGuardrails }: GuardrailsProps) {
     "Relevance Guardrail": "Ensure messages are relevant to airline support",
     "Jailbreak Guardrail":
       "Detect and block attempts to bypass or override system instructions",
+    Moderation: "Block unsafe or policy-violating content before queries run",
+    "Prompt Injection Detection":
+      "Detect attempts to manipulate instructions or misuse connected tools",
   };
 
   const extractGuardrailName = (rawName: string): string =>

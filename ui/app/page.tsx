@@ -2,9 +2,13 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { AgentPanel } from "@/components/agent-panel";
+import { AnalyticsConfigPanel } from "@/components/analytics-config-panel";
 import { ChatKitPanel } from "@/components/chatkit-panel";
 import type { Agent, AgentEvent, GuardrailCheck } from "@/lib/types";
 import { fetchBootstrapState, fetchThreadState } from "@/lib/api";
+
+const ANALYTICS_INSTRUCTION_STORAGE_KEY = "analytics_chat_instruction";
+const ANALYTICS_SCHEMA_STORAGE_KEY = "analytics_chat_schema";
 
 export default function Home() {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -14,6 +18,8 @@ export default function Home() {
   const [context, setContext] = useState<Record<string, any>>({});
   const [threadId, setThreadId] = useState<string | null>(null);
   const [initialThreadId, setInitialThreadId] = useState<string | null>(null);
+  const [instruction, setInstruction] = useState("");
+  const [schema, setSchema] = useState("");
 
   const normalizeEvents = useCallback((items: AgentEvent[]) => {
     if (!items.length) return items;
@@ -94,6 +100,44 @@ export default function Home() {
     })();
   }, []);
 
+  useEffect(() => {
+    try {
+      const savedInstruction = window.localStorage.getItem(
+        ANALYTICS_INSTRUCTION_STORAGE_KEY
+      );
+      const savedSchema = window.localStorage.getItem(
+        ANALYTICS_SCHEMA_STORAGE_KEY
+      );
+      if (savedInstruction !== null) {
+        setInstruction(savedInstruction);
+      }
+      if (savedSchema !== null) {
+        setSchema(savedSchema);
+      }
+    } catch (error) {
+      console.error("Failed to load analytics config from localStorage:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        ANALYTICS_INSTRUCTION_STORAGE_KEY,
+        instruction
+      );
+    } catch (error) {
+      console.error("Failed to persist instruction to localStorage:", error);
+    }
+  }, [instruction]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ANALYTICS_SCHEMA_STORAGE_KEY, schema);
+    } catch (error) {
+      console.error("Failed to persist schema to localStorage:", error);
+    }
+  }, [schema]);
+
   const handleThreadChange = useCallback((id: string | null) => {
     setThreadId(id);
   }, []);
@@ -108,15 +152,25 @@ export default function Home() {
 
   return (
     <main className="flex h-screen gap-2 bg-gray-100 p-2">
-      <AgentPanel
-        agents={agents}
-        currentAgent={currentAgent}
-        events={events}
-        guardrails={guardrails}
-        context={context}
-      />
+      <div className="flex h-full w-3/5 flex-col gap-2">
+        <AnalyticsConfigPanel
+          instruction={instruction}
+          schema={schema}
+          onInstructionChange={setInstruction}
+          onSchemaChange={setSchema}
+        />
+        <AgentPanel
+          agents={agents}
+          currentAgent={currentAgent}
+          events={events}
+          guardrails={guardrails}
+          context={context}
+        />
+      </div>
       <ChatKitPanel
         initialThreadId={initialThreadId}
+        instruction={instruction}
+        schema={schema}
         onThreadChange={handleThreadChange}
         onResponseEnd={handleResponseEnd}
         onRunnerBindThread={handleBindThread}

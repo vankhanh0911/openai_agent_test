@@ -5,25 +5,12 @@ import os
 from typing import Any, Dict
 
 from chatkit.server import StreamingResult
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
-from airline.agents import (
-    booking_cancellation_agent,
-    faq_agent,
-    flight_information_agent,
-    refunds_compensation_agent,
-    seat_special_services_agent,
-    triage_agent,
-)
-from airline.context import (
-    AirlineAgentChatContext,
-    AirlineAgentContext,
-    create_initial_context,
-    public_context,
-)
-from server import AirlineServer
+from analytics import AnalyticsWorkflowInput, run_analytics_workflow
+from analytics.chat_server import AnalyticsServer
 
 app = FastAPI()
 
@@ -39,19 +26,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-chat_server = AirlineServer()
+chat_server = AnalyticsServer()
 
 
-def get_server() -> AirlineServer:
+def get_server() -> AnalyticsServer:
     return chat_server
+
+
+def _request_context_from_payload(request: Request, payload: bytes) -> Dict[str, Any]:
+    context: Dict[str, Any] = {"request": request}
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return context
+
+    metadata = parsed.get("metadata") or {}
+    if isinstance(metadata, dict):
+        instruction = metadata.get("analysis_instruction")
+        schema = metadata.get("analysis_schema")
+        if isinstance(instruction, str):
+            context["analysis_instruction"] = instruction
+        if isinstance(schema, str):
+            context["analysis_schema"] = schema
+    return context
 
 
 @app.post("/chatkit")
 async def chatkit_endpoint(
-    request: Request, server: AirlineServer = Depends(get_server)
+    request: Request, server: AnalyticsServer = Depends(get_server)
 ) -> Response:
     payload = await request.body()
-    result = await server.process(payload, {"request": request})
+    result = await server.process(payload, _request_context_from_payload(request, payload))
     if isinstance(result, StreamingResult):
         return StreamingResponse(result, media_type="text/event-stream")
     if hasattr(result, "json"):
@@ -62,14 +67,14 @@ async def chatkit_endpoint(
 @app.get("/chatkit/state")
 async def chatkit_state(
     thread_id: str = Query(...),
-    server: AirlineServer = Depends(get_server),
+    server: AnalyticsServer = Depends(get_server),
 ) -> Dict[str, Any]:
     return await server.snapshot(thread_id, {"request": None})
 
 
 @app.get("/chatkit/bootstrap")
 async def chatkit_bootstrap(
-    server: AirlineServer = Depends(get_server),
+    server: AnalyticsServer = Depends(get_server),
 ) -> Dict[str, Any]:
     return await server.snapshot(None, {"request": None})
 
@@ -77,7 +82,7 @@ async def chatkit_bootstrap(
 @app.get("/chatkit/state/stream")
 async def chatkit_state_stream(
     thread_id: str = Query(...),
-    server: AirlineServer = Depends(get_server),
+    server: AnalyticsServer = Depends(get_server),
 ):
     thread = await server.ensure_thread(thread_id, {"request": None})
     queue = server.register_listener(thread.id)
@@ -100,17 +105,18 @@ async def health_check() -> Dict[str, str]:
     return {"status": "healthy"}
 
 
+@app.post("/analytics/run")
+async def analytics_run(workflow_input: AnalyticsWorkflowInput) -> Dict[str, Any]:
+    try:
+        return await run_analytics_workflow(workflow_input)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 __all__ = [
-    "AirlineAgentChatContext",
-    "AirlineAgentContext",
+    "AnalyticsWorkflowInput",
+    "AnalyticsServer",
     "app",
-    "booking_cancellation_agent",
+    "analytics_run",
     "chat_server",
-    "create_initial_context",
-    "faq_agent",
-    "flight_information_agent",
-    "public_context",
-    "refunds_compensation_agent",
-    "seat_special_services_agent",
-    "triage_agent",
 ]
