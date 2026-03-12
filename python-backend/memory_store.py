@@ -27,6 +27,80 @@ class MemoryStore(Store[dict[str, Any]]):
         return f"atc_{uuid4().hex[:8]}"
 
     @staticmethod
+    def _normalize_session_value(value: Any, default: str) -> str:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+        return default
+
+    @classmethod
+    def _session_key_from_context(cls, context: dict[str, Any]) -> str:
+        explicit = context.get("session_key")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+
+        portal_id = cls._normalize_session_value(
+            context.get("analysis_portal_id") or context.get("portal_id"),
+            "default-portal",
+        )
+        account_id = cls._normalize_session_value(
+            context.get("analysis_account_id") or context.get("account_id"),
+            "default-account",
+        )
+        return f"{portal_id}:{account_id}"
+
+    @classmethod
+    def _decorate_thread_metadata(
+        cls,
+        thread: ThreadMetadata | Thread,
+        context: dict[str, Any],
+    ) -> ThreadMetadata:
+        metadata = cls._get_thread_metadata(thread)
+        session_key = cls._session_key_from_context(context)
+        portal_id, account_id = session_key.split(":", 1)
+        metadata.metadata = {
+            **(metadata.metadata or {}),
+            "session_key": session_key,
+            "portal_id": portal_id,
+            "account_id": account_id,
+        }
+        return metadata
+
+    @classmethod
+    def _thread_session_key(cls, thread: ThreadMetadata) -> str:
+        metadata = thread.metadata or {}
+        session_key = metadata.get("session_key")
+        if isinstance(session_key, str) and session_key.strip():
+            return session_key.strip()
+
+        portal_id = cls._normalize_session_value(metadata.get("portal_id"), "default-portal")
+        account_id = cls._normalize_session_value(
+            metadata.get("account_id"), "default-account"
+        )
+        return f"{portal_id}:{account_id}"
+
+    @classmethod
+    def _thread_matches_context(
+        cls,
+        thread: ThreadMetadata,
+        context: dict[str, Any],
+    ) -> bool:
+        return cls._thread_session_key(thread) == cls._session_key_from_context(context)
+
+    def _state_for_thread(self, thread_id: str) -> _ThreadState:
+        state = self._threads.get(thread_id)
+        if state is None:
+            raise NotFoundError(f"Thread {thread_id} not found")
+        return state
+
+    def _assert_thread_access(self, thread_id: str, context: dict[str, Any]) -> _ThreadState:
+        state = self._state_for_thread(thread_id)
+        if not self._thread_matches_context(state.thread, context):
+            raise NotFoundError(f"Thread {thread_id} not found")
+        return state
+
+    @staticmethod
     def _get_thread_metadata(thread: ThreadMetadata | Thread) -> ThreadMetadata:
         """Return thread metadata without any embedded items (openai-chatkit>=1.0)."""
         has_items = isinstance(thread, Thread) or "items" in getattr(
@@ -41,13 +115,11 @@ class MemoryStore(Store[dict[str, Any]]):
 
     # -- Thread metadata -------------------------------------------------
     async def load_thread(self, thread_id: str, context: dict[str, Any]) -> ThreadMetadata:
-        state = self._threads.get(thread_id)
-        if not state:
-            raise NotFoundError(f"Thread {thread_id} not found")
+        state = self._assert_thread_access(thread_id, context)
         return self._get_thread_metadata(state.thread)
 
     async def save_thread(self, thread: ThreadMetadata, context: dict[str, Any]) -> None:
-        metadata = self._get_thread_metadata(thread)
+        metadata = self._decorate_thread_metadata(thread, context)
         state = self._threads.get(thread.id)
         if state:
             state.thread = metadata
@@ -65,7 +137,11 @@ class MemoryStore(Store[dict[str, Any]]):
         context: dict[str, Any],
     ) -> Page[ThreadMetadata]:
         threads = sorted(
-            (self._get_thread_metadata(state.thread) for state in self._threads.values()),
+            (
+                self._get_thread_metadata(state.thread)
+                for state in self._threads.values()
+                if self._thread_matches_context(state.thread, context)
+            ),
             key=lambda t: t.created_at or datetime.min,
             reverse=(order == "desc"),
         )
@@ -87,6 +163,7 @@ class MemoryStore(Store[dict[str, Any]]):
         )
 
     async def delete_thread(self, thread_id: str, context: dict[str, Any]) -> None:
+        self._assert_thread_access(thread_id, context)
         self._threads.pop(thread_id, None)
 
     # -- Thread items ----------------------------------------------------
@@ -108,6 +185,7 @@ class MemoryStore(Store[dict[str, Any]]):
         order: str,
         context: dict[str, Any],
     ) -> Page[ThreadItem]:
+        self._assert_thread_access(thread_id, context)
         items = [item.model_copy(deep=True) for item in self._items(thread_id)]
         items.sort(
             key=lambda item: getattr(item, "created_at", datetime.utcnow()),
@@ -129,9 +207,11 @@ class MemoryStore(Store[dict[str, Any]]):
     async def add_thread_item(
         self, thread_id: str, item: ThreadItem, context: dict[str, Any]
     ) -> None:
+        self._assert_thread_access(thread_id, context)
         self._items(thread_id).append(item.model_copy(deep=True))
 
     async def save_item(self, thread_id: str, item: ThreadItem, context: dict[str, Any]) -> None:
+        self._assert_thread_access(thread_id, context)
         items = self._items(thread_id)
         for idx, existing in enumerate(items):
             if existing.id == item.id:
@@ -140,6 +220,7 @@ class MemoryStore(Store[dict[str, Any]]):
         items.append(item.model_copy(deep=True))
 
     async def load_item(self, thread_id: str, item_id: str, context: dict[str, Any]) -> ThreadItem:
+        self._assert_thread_access(thread_id, context)
         for item in self._items(thread_id):
             if item.id == item_id:
                 return item.model_copy(deep=True)
@@ -148,6 +229,7 @@ class MemoryStore(Store[dict[str, Any]]):
     async def delete_thread_item(
         self, thread_id: str, item_id: str, context: dict[str, Any]
     ) -> None:
+        self._assert_thread_access(thread_id, context)
         items = self._items(thread_id)
         self._threads[thread_id].items = [item for item in items if item.id != item_id]
 

@@ -7,6 +7,8 @@ type ChatKitPanelProps = {
   initialThreadId?: string | null;
   instruction: string;
   schema: string;
+  portalId: string;
+  accountId: string;
   onThreadChange?: (threadId: string | null) => void;
   onResponseEnd?: () => void;
   onRunnerUpdate?: () => void;
@@ -21,6 +23,8 @@ export function ChatKitPanel({
   initialThreadId,
   instruction,
   schema,
+  portalId,
+  accountId,
   onThreadChange,
   onResponseEnd,
   onRunnerUpdate,
@@ -43,6 +47,8 @@ export function ChatKitPanel({
             ...(payload.metadata ?? {}),
             analysis_instruction: instruction,
             analysis_schema: schema,
+            analysis_portal_id: portalId,
+            analysis_account_id: accountId,
           };
           nextBody = JSON.stringify(payload);
         } catch {
@@ -62,7 +68,7 @@ export function ChatKitPanel({
       placeholder: "Ask an analytics question...",
     },
     history: {
-      enabled: false,
+      enabled: true,
     },
     theme: {
       colorScheme: "light",

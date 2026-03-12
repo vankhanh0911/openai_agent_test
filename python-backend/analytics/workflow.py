@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 from agents import (
     Agent,
@@ -238,6 +239,8 @@ class AnalyticsWorkflowInput(BaseModel):
     input_as_text: str
     instruction_text: str | None = Field(default=None, alias="instruction")
     schema_text: str | None = Field(default=None, alias="schema")
+    portal_id: str | None = Field(default=None, alias="portalId")
+    account_id: str | None = Field(default=None, alias="accountId")
 
 
 class AnalysisContext:
@@ -330,20 +333,25 @@ def _build_mcp_tool(settings: AnalyticsSettings) -> HostedMCPTool:
 def analysis_instructions(
     run_context: RunContextWrapper[AnalysisContext], _agent: Agent[AnalysisContext]
 ) -> str:
-    instruction_text = run_context.context.instruction_text
-    schema_text = run_context.context.schema_text
-
-    print(f"{instruction_text}\n\n"
-        f"User request: {run_context.context.workflow_input_as_text}\n\n"
-        "Available cube schema:\n"
-        f"{schema_text}")
-        
+    instruction_text = run_context.context.instruction_text or DEFAULT_ANALYSIS_INSTRUCTION
+    schema_text = run_context.context.schema_text or ARISTINO_SCHEMA
     return (
         f"{instruction_text}\n\n"
         f"User request: {run_context.context.workflow_input_as_text}\n\n"
         "Available cube schema:\n"
         f"{schema_text}"
     )
+
+
+def build_trace_identity(
+    portal_id: str | None,
+    account_id: str | None,
+) -> tuple[str, str]:
+    normalized_portal = (portal_id or "default-portal").strip() or "default-portal"
+    normalized_account = (account_id or "default-account").strip() or "default-account"
+    group_id = f"{normalized_portal}:{normalized_account}"
+    trace_id = f"analytics:{group_id}:{uuid4().hex}"
+    return trace_id, group_id
 
 
 def _build_guardrails_config(settings: AnalyticsSettings) -> dict[str, Any]:
@@ -560,8 +568,24 @@ async def run_and_apply_guardrails(
 
 async def run_analytics_workflow(workflow_input: AnalyticsWorkflowInput) -> dict[str, Any]:
     settings = AnalyticsSettings.from_env()
+    trace_id, group_id = build_trace_identity(
+        workflow_input.portal_id,
+        workflow_input.account_id,
+    )
+    trace_metadata = {
+        "__trace_source__": "agent-builder",
+        "portal_id": workflow_input.portal_id or "",
+        "account_id": workflow_input.account_id or "",
+    }
+    
+    trace_metadata["workflow_id"] = trace_id
 
-    with trace(settings.trace_name):
+    with trace(
+        settings.trace_name,
+        trace_id=trace_id,
+        group_id=group_id,
+        metadata=trace_metadata,
+    ):
         workflow = workflow_input.model_dump()
         conversation_history: list[TResponseInputItem] = [
             {
@@ -585,14 +609,15 @@ async def run_analytics_workflow(workflow_input: AnalyticsWorkflowInput) -> dict
             }
 
         analysis_agent = _build_analysis_agent(settings)
-        trace_metadata = {"__trace_source__": "agent-builder"}
-        if settings.trace_workflow_id:
-            trace_metadata["workflow_id"] = settings.trace_workflow_id
 
         analysis_result_temp = await Runner.run(
             analysis_agent,
             input=conversation_history,
-            run_config=RunConfig(trace_metadata=trace_metadata),
+            run_config=RunConfig(
+                trace_id=trace_id,
+                group_id=group_id,
+                trace_metadata=trace_metadata,
+            ),
             context=AnalysisContext(
                 workflow_input_as_text=workflow["input_as_text"],
                 instruction_text=workflow.get("instruction_text"),

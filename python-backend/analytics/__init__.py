@@ -4,6 +4,7 @@ from .workflow import (
     AnalyticsWorkflowInput,
     build_analytics_agent,
     build_analytics_guardrails_config,
+    build_trace_identity,
     run_analytics_workflow,
     run_and_apply_guardrails,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "AnalyticsWorkflowInput",
     "build_analytics_agent",
     "build_analytics_guardrails_config",
+    "build_trace_identity",
     "run_analytics_workflow",
     "run_and_apply_guardrails",
 ]

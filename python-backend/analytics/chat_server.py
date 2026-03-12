@@ -11,6 +11,7 @@ from uuid import uuid4
 from agents import (
     ItemHelpers,
     MessageOutputItem,
+    RunConfig,
     Runner,
     ToolCallItem,
     ToolCallOutputItem,
@@ -35,6 +36,7 @@ from analytics import (
     AnalyticsSettings,
     build_analytics_agent,
     build_analytics_guardrails_config,
+    build_trace_identity,
     run_and_apply_guardrails,
 )
 from memory_store import MemoryStore
@@ -107,6 +109,7 @@ class ConversationState:
     current_agent_name: str = "Analysis"
     events: List[AgentEvent] = field(default_factory=list)
     guardrails: List[GuardrailCheck] = field(default_factory=list)
+    session_key: str | None = None
     context: Dict[str, Any] = field(
         default_factory=lambda: {
             "portal": "aristino",
@@ -328,6 +331,20 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
         user_text = ""
         instruction_override = _normalize_override(context.get("analysis_instruction"))
         schema_override = _normalize_override(context.get("analysis_schema"))
+        portal_id = _normalize_override(context.get("analysis_portal_id"))
+        account_id = _normalize_override(context.get("analysis_account_id"))
+        session_key = f"{portal_id or 'default-portal'}:{account_id or 'default-account'}"
+
+        if state.session_key and state.session_key != session_key:
+            state.input_items = []
+            state.events = []
+            state.guardrails = []
+            state.context = {
+                "portal": "aristino",
+                "mode": "analytics",
+                "mcp_tool": "read_query",
+            }
+        state.session_key = session_key
 
         if input_user_message is not None:
             user_text = _user_message_to_text(input_user_message)
@@ -341,6 +358,11 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
 
         state.context["instruction_configured"] = bool(instruction_override)
         state.context["schema_configured"] = bool(schema_override)
+        state.context["portal_id"] = portal_id or ""
+        state.context["account_id"] = account_id or ""
+        state.context["portal_id_configured"] = bool(portal_id)
+        state.context["account_id_configured"] = bool(account_id)
+        state.context["session_key"] = session_key
         if instruction_override:
             state.context["instruction_preview"] = self._truncate(instruction_override, 180)
             state.context["instruction_length"] = len(instruction_override)
@@ -363,6 +385,14 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
         guardrails_config = build_analytics_guardrails_config(settings)
         workflow = {"input_as_text": user_text}
         conversation_history = list(state.input_items)
+        trace_id, group_id = build_trace_identity(portal_id, account_id)
+        trace_metadata = {
+            "__trace_source__": "agent-builder",
+            "portal_id": portal_id or "",
+            "account_id": account_id or "",
+        }
+        if settings.trace_workflow_id:
+            trace_metadata["workflow_id"] = settings.trace_workflow_id
 
         try:
             guardrails_result = await run_and_apply_guardrails(
@@ -409,6 +439,11 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
                     workflow_input_as_text=workflow["input_as_text"],
                     instruction_text=instruction_override,
                     schema_text=schema_override,
+                ),
+                run_config=RunConfig(
+                    trace_id=trace_id,
+                    group_id=group_id,
+                    trace_metadata=trace_metadata,
                 ),
             )
             async for event in stream_agent_response(chat_context, result):

@@ -44,10 +44,27 @@ def _request_context_from_payload(request: Request, payload: bytes) -> Dict[str,
     if isinstance(metadata, dict):
         instruction = metadata.get("analysis_instruction")
         schema = metadata.get("analysis_schema")
+        portal_id = metadata.get("analysis_portal_id")
+        account_id = metadata.get("analysis_account_id")
         if isinstance(instruction, str):
             context["analysis_instruction"] = instruction
         if isinstance(schema, str):
             context["analysis_schema"] = schema
+        if isinstance(portal_id, str):
+            context["analysis_portal_id"] = portal_id
+        if isinstance(account_id, str):
+            context["analysis_account_id"] = account_id
+    return context
+
+
+def _request_context_from_query(request: Request) -> Dict[str, Any]:
+    context: Dict[str, Any] = {"request": request}
+    portal_id = request.query_params.get("portal_id")
+    account_id = request.query_params.get("account_id")
+    if isinstance(portal_id, str):
+        context["analysis_portal_id"] = portal_id
+    if isinstance(account_id, str):
+        context["analysis_account_id"] = account_id
     return context
 
 
@@ -66,30 +83,34 @@ async def chatkit_endpoint(
 
 @app.get("/chatkit/state")
 async def chatkit_state(
+    request: Request,
     thread_id: str = Query(...),
     server: AnalyticsServer = Depends(get_server),
 ) -> Dict[str, Any]:
-    return await server.snapshot(thread_id, {"request": None})
+    return await server.snapshot(thread_id, _request_context_from_query(request))
 
 
 @app.get("/chatkit/bootstrap")
 async def chatkit_bootstrap(
+    request: Request,
     server: AnalyticsServer = Depends(get_server),
 ) -> Dict[str, Any]:
-    return await server.snapshot(None, {"request": None})
+    return await server.snapshot(None, _request_context_from_query(request))
 
 
 @app.get("/chatkit/state/stream")
 async def chatkit_state_stream(
+    request: Request,
     thread_id: str = Query(...),
     server: AnalyticsServer = Depends(get_server),
 ):
-    thread = await server.ensure_thread(thread_id, {"request": None})
+    context = _request_context_from_query(request)
+    thread = await server.ensure_thread(thread_id, context)
     queue = server.register_listener(thread.id)
 
     async def event_generator():
         try:
-            initial = await server.snapshot(thread.id, {"request": None})
+            initial = await server.snapshot(thread.id, context)
             yield f"data: {json.dumps(initial, default=str)}\n\n"
             while True:
                 data = await queue.get()
