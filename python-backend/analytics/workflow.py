@@ -349,8 +349,8 @@ def build_trace_identity(
 ) -> tuple[str, str]:
     normalized_portal = (portal_id or "default-portal").strip() or "default-portal"
     normalized_account = (account_id or "default-account").strip() or "default-account"
-    group_id = f"{normalized_portal}:{normalized_account}"
-    trace_id = f"analytics:{group_id}:{uuid4().hex}"
+    group_id = f"{normalized_portal}_{normalized_account}"
+    trace_id = f"trace_{group_id}_{uuid4().hex}"
     return trace_id, group_id
 
 
