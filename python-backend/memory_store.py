@@ -94,6 +94,19 @@ class MemoryStore(Store[dict[str, Any]]):
             raise NotFoundError(f"Thread {thread_id} not found")
         return state
 
+    def _restore_missing_thread(
+        self,
+        thread_id: str,
+        context: dict[str, Any],
+    ) -> _ThreadState:
+        metadata = self._decorate_thread_metadata(
+            ThreadMetadata(id=thread_id, created_at=datetime.utcnow()),
+            context,
+        )
+        state = _ThreadState(thread=metadata, items=[])
+        self._threads[thread_id] = state
+        return state
+
     def _assert_thread_access(self, thread_id: str, context: dict[str, Any]) -> _ThreadState:
         state = self._state_for_thread(thread_id)
         if not self._thread_matches_context(state.thread, context):
@@ -115,7 +128,10 @@ class MemoryStore(Store[dict[str, Any]]):
 
     # -- Thread metadata -------------------------------------------------
     async def load_thread(self, thread_id: str, context: dict[str, Any]) -> ThreadMetadata:
-        state = self._assert_thread_access(thread_id, context)
+        try:
+            state = self._assert_thread_access(thread_id, context)
+        except NotFoundError:
+            state = self._restore_missing_thread(thread_id, context)
         return self._get_thread_metadata(state.thread)
 
     async def save_thread(self, thread: ThreadMetadata, context: dict[str, Any]) -> None:
@@ -185,7 +201,10 @@ class MemoryStore(Store[dict[str, Any]]):
         order: str,
         context: dict[str, Any],
     ) -> Page[ThreadItem]:
-        self._assert_thread_access(thread_id, context)
+        try:
+            self._assert_thread_access(thread_id, context)
+        except NotFoundError:
+            self._restore_missing_thread(thread_id, context)
         items = [item.model_copy(deep=True) for item in self._items(thread_id)]
         items.sort(
             key=lambda item: getattr(item, "created_at", datetime.utcnow()),

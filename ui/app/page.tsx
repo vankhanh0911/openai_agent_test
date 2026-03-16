@@ -22,7 +22,7 @@ function buildSessionContext(
   return {
     portal: "aristino",
     mode: "analytics",
-    mcp_tool: "read_query",
+    mcp_tool: "read_data",
     ...(baseContext ?? {}),
     portal_id: normalizedPortalId,
     account_id: normalizedAccountId,
@@ -30,7 +30,7 @@ function buildSessionContext(
     account_id_configured: Boolean(normalizedAccountId),
     session_key: `${
       normalizedPortalId || "default-portal"
-    }:${normalizedAccountId || "default-account"}`,
+    }_${normalizedAccountId || "default-account"}`,
   };
 }
 

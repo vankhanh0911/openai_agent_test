@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from agents import (
@@ -16,6 +19,13 @@ from agents import (
     Runner,
     TResponseInputItem,
     trace,
+)
+from agents.mcp import (
+    MCPServer,
+    MCPServerManager,
+    MCPServerSse,
+    MCPServerStreamableHttp,
+    create_static_tool_filter,
 )
 from openai import AsyncOpenAI, OpenAIError
 from openai.types.shared import Reasoning
@@ -37,6 +47,9 @@ ENV_DEFAULTS = {
     if isinstance(value, str) and value.strip()
 }
 
+OPENAI_REQUEST_LOGGER = logging.getLogger("analytics.openai")
+_OPENAI_REQUEST_LOG_PATH: str | None = None
+
 
 def _env(name: str, default: str | None = None) -> str | None:
     value = os.getenv(name)
@@ -48,6 +61,183 @@ def _env(name: str, default: str | None = None) -> str | None:
         return fallback.strip()
 
     return default
+
+
+def _ensure_openai_request_logging() -> None:
+    global _OPENAI_REQUEST_LOG_PATH
+
+    desired_path = str(
+        Path(
+            _env(
+                "ARISTINO_OPENAI_LOG_PATH",
+                str(Path(__file__).resolve().parents[1] / "analytics_openai.log"),
+            )
+            or (Path(__file__).resolve().parents[1] / "analytics_openai.log")
+        )
+    )
+
+    OPENAI_REQUEST_LOGGER.setLevel(logging.INFO)
+    OPENAI_REQUEST_LOGGER.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    if not any(isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler) for handler in OPENAI_REQUEST_LOGGER.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(formatter)
+        OPENAI_REQUEST_LOGGER.addHandler(stream_handler)
+
+    if _OPENAI_REQUEST_LOG_PATH != desired_path:
+        for handler in list(OPENAI_REQUEST_LOGGER.handlers):
+            if isinstance(handler, logging.FileHandler):
+                OPENAI_REQUEST_LOGGER.removeHandler(handler)
+                handler.close()
+
+        log_path = Path(desired_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        OPENAI_REQUEST_LOGGER.addHandler(file_handler)
+        _OPENAI_REQUEST_LOG_PATH = desired_path
+
+
+def _estimate_chars(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(_estimate_chars(item) for item in value)
+    if isinstance(value, dict):
+        return sum(len(str(key)) + _estimate_chars(item) for key, item in value.items())
+    return len(str(value))
+
+
+def _truncate_log_string(value: str, limit: int = 240) -> str:
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return value[:limit] + f"...[truncated {omitted} chars]"
+
+
+def _preview_openai_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return _truncate_log_string(value)
+    if isinstance(value, list):
+        preview = [_preview_openai_payload(item) for item in value[-3:]]
+        if len(value) > 3:
+            preview.insert(0, {"truncated_items": len(value) - 3})
+        return preview
+    if isinstance(value, dict):
+        preferred_keys = (
+            "role",
+            "type",
+            "content",
+            "text",
+            "output",
+            "arguments",
+            "call_id",
+            "name",
+            "summary",
+        )
+        preview: dict[str, Any] = {}
+        for key in preferred_keys:
+            if key in value:
+                preview[key] = _preview_openai_payload(value[key])
+        if preview:
+            return preview
+        return {
+            str(key): _preview_openai_payload(item)
+            for key, item in list(value.items())[:5]
+        }
+    return value
+
+
+def _summarize_input_item(index: int, item: Any) -> dict[str, Any]:
+    role = item.get("role") if isinstance(item, dict) else None
+    item_type = item.get("type") if isinstance(item, dict) else None
+    return {
+        "index": index,
+        "role": role,
+        "type": item_type,
+        "approx_chars": _estimate_chars(item),
+        "preview": _preview_openai_payload(item),
+    }
+
+
+def build_openai_request_summary(
+    *,
+    model: str,
+    trace_id: str,
+    run_kind: str,
+    input_items: list[Any],
+    instruction_text: str | None,
+    schema_text: str | None,
+    tool_names: tuple[str, ...] | list[str] | None,
+) -> dict[str, Any]:
+    input_chars = _estimate_chars(input_items)
+    instruction_chars = _estimate_chars(instruction_text)
+    schema_chars = _estimate_chars(schema_text)
+    input_item_summaries = [
+        _summarize_input_item(index, item)
+        for index, item in enumerate(input_items[-8:], start=max(len(input_items) - 8, 0))
+    ]
+    if len(input_items) > 8:
+        input_item_summaries.insert(
+            0,
+            {"truncated_items": len(input_items) - 8},
+        )
+    return {
+        "event": "openai_request",
+        "trace_id": trace_id,
+        "run_kind": run_kind,
+        "model": model,
+        "item_count": len(input_items),
+        "approx_input_chars": input_chars,
+        "instruction_chars": instruction_chars,
+        "schema_chars": schema_chars,
+        "approx_total_chars": input_chars + instruction_chars + schema_chars,
+        "tool_names": list(tool_names or []),
+        "input_preview": _preview_openai_payload(input_items),
+        "instruction_preview": _preview_openai_payload(instruction_text or ""),
+        "schema_preview": _preview_openai_payload(schema_text or ""),
+        "input_items": input_item_summaries,
+    }
+
+
+def log_openai_request(
+    *,
+    model: str,
+    trace_id: str,
+    run_kind: str,
+    input_items: list[Any],
+    instruction_text: str | None,
+    schema_text: str | None,
+    tool_names: tuple[str, ...] | list[str] | None,
+) -> dict[str, Any]:
+    _ensure_openai_request_logging()
+    summary = build_openai_request_summary(
+        model=model,
+        trace_id=trace_id,
+        run_kind=run_kind,
+        input_items=input_items,
+        instruction_text=instruction_text,
+        schema_text=schema_text,
+        tool_names=tool_names,
+    )
+    OPENAI_REQUEST_LOGGER.info(json.dumps(summary, ensure_ascii=False, default=str))
+    return summary
+
+
+def log_openai_failure(summary: dict[str, Any], exc: Exception) -> None:
+    _ensure_openai_request_logging()
+    failure_summary = {
+        **summary,
+        "event": "openai_request_failed",
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    OPENAI_REQUEST_LOGGER.exception(json.dumps(failure_summary, ensure_ascii=False, default=str))
 
 
 ARISTINO_SCHEMA = """
@@ -270,16 +460,19 @@ class AnalyticsSettings:
     def from_env(cls) -> "AnalyticsSettings":
         allowed_tools = tuple(
             tool.strip()
-            for tool in (_env("ARISTINO_MCP_ALLOWED_TOOLS", "read_query") or "read_query").split(",")
+            for tool in (
+                _env("ARISTINO_MCP_ALLOWED_TOOLS", "get_metadata,read_data")
+                or "get_metadata,read_data"
+            ).split(",")
             if tool.strip()
         )
         return cls(
             analysis_model=_env("ARISTINO_ANALYSIS_MODEL", "gpt-5.2") or "gpt-5.2",
             mcp_server_url=_env("ARISTINO_MCP_SERVER_URL", "") or "",
-            mcp_server_label=_env("ARISTINO_MCP_SERVER_LABEL", "Dimension_Metrics_Identified")
-            or "Dimension_Metrics_Identified",
+            mcp_server_label=_env("ARISTINO_MCP_SERVER_LABEL", "Cube data")
+            or "Cube data",
             mcp_authorization=_env("ARISTINO_MCP_AUTHORIZATION"),
-            mcp_allowed_tools=allowed_tools or ("read_query",),
+            mcp_allowed_tools=allowed_tools or ("get_metadata", "read_data"),
             trace_name=_env("ARISTINO_TRACE_NAME", "AR Data Analytics") or "AR Data Analytics",
             trace_workflow_id=_env("ARISTINO_TRACE_WORKFLOW_ID"),
             prompt_injection_model=_env("ARISTINO_PROMPT_INJECTION_MODEL", "gpt-4.1-mini")
@@ -330,11 +523,53 @@ def _build_mcp_tool(settings: AnalyticsSettings) -> HostedMCPTool:
     )
 
 
+def _build_mcp_headers(settings: AnalyticsSettings) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if settings.mcp_authorization:
+        headers["authorization"] = settings.mcp_authorization
+    return headers
+
+
+def _is_local_mcp_url(server_url: str) -> bool:
+    parsed = urlparse(server_url)
+    hostname = (parsed.hostname or "").lower()
+    return hostname in {"127.0.0.1", "localhost"}
+
+
+def _build_network_mcp_server(settings: AnalyticsSettings) -> MCPServer:
+    if not settings.mcp_server_url:
+        raise RuntimeError(
+            "Missing ARISTINO_MCP_SERVER_URL. Set the MCP endpoint before calling analytics."
+        )
+
+    headers = _build_mcp_headers(settings)
+    tool_filter = create_static_tool_filter(
+        allowed_tool_names=list(settings.mcp_allowed_tools) or None,
+    )
+    common_kwargs = {
+        "cache_tools_list": True,
+        "name": settings.mcp_server_label,
+        "require_approval": "never",
+        "tool_filter": tool_filter,
+    }
+    params: dict[str, Any] = {"url": settings.mcp_server_url}
+    if headers:
+        params["headers"] = headers
+
+    if urlparse(settings.mcp_server_url).path.endswith("/sse"):
+        return MCPServerSse(params=params, **common_kwargs)
+    return MCPServerStreamableHttp(params=params, **common_kwargs)
+
+
+def _build_local_mcp_server(settings: AnalyticsSettings) -> MCPServer:
+    return _build_network_mcp_server(settings)
+
+
 def analysis_instructions(
     run_context: RunContextWrapper[AnalysisContext], _agent: Agent[AnalysisContext]
 ) -> str:
-    instruction_text = run_context.context.instruction_text or DEFAULT_ANALYSIS_INSTRUCTION
-    schema_text = run_context.context.schema_text or ARISTINO_SCHEMA
+    instruction_text = run_context.context.instruction_text or ""
+    schema_text = run_context.context.schema_text or ""
     return (
         f"{instruction_text}\n\n"
         f"User request: {run_context.context.workflow_input_as_text}\n\n"
@@ -373,7 +608,23 @@ def _build_guardrails_config(settings: AnalyticsSettings) -> dict[str, Any]:
     }
 
 
-def _build_analysis_agent(settings: AnalyticsSettings) -> Agent[AnalysisContext]:
+def _build_analysis_agent(
+    settings: AnalyticsSettings,
+    *,
+    mcp_servers: list[MCPServer] | None = None,
+) -> Agent[AnalysisContext]:
+    if mcp_servers is not None:
+        return Agent(
+            name="Analysis",
+            instructions=analysis_instructions,
+            model=settings.analysis_model,
+            mcp_servers=list(mcp_servers),
+            model_settings=ModelSettings(
+                store=True,
+                reasoning=Reasoning(effort="low", summary="auto"),
+            ),
+        )
+
     return Agent(
         name="Analysis",
         instructions=analysis_instructions,
@@ -390,8 +641,12 @@ def build_analytics_guardrails_config(settings: AnalyticsSettings) -> dict[str, 
     return _build_guardrails_config(settings)
 
 
-def build_analytics_agent(settings: AnalyticsSettings) -> Agent[AnalysisContext]:
-    return _build_analysis_agent(settings)
+def build_analytics_agent(
+    settings: AnalyticsSettings,
+    *,
+    mcp_servers: list[MCPServer] | None = None,
+) -> Agent[AnalysisContext]:
+    return _build_analysis_agent(settings, mcp_servers=mcp_servers)
 
 
 def guardrails_has_tripwire(results: list[Any] | None) -> bool:
@@ -608,22 +863,42 @@ async def run_analytics_workflow(workflow_input: AnalyticsWorkflowInput) -> dict
                 "output_text": None,
             }
 
-        analysis_agent = _build_analysis_agent(settings)
-
-        analysis_result_temp = await Runner.run(
-            analysis_agent,
-            input=conversation_history,
-            run_config=RunConfig(
+        async with MCPServerManager(
+            [_build_network_mcp_server(settings)],
+            strict=True,
+        ) as manager:
+            analysis_agent = _build_analysis_agent(
+                settings,
+                mcp_servers=manager.active_servers,
+            )
+            request_summary = log_openai_request(
+                model=settings.analysis_model,
                 trace_id=trace_id,
-                group_id=group_id,
-                trace_metadata=trace_metadata,
-            ),
-            context=AnalysisContext(
-                workflow_input_as_text=workflow["input_as_text"],
+                run_kind="run",
+                input_items=conversation_history,
                 instruction_text=workflow.get("instruction_text"),
                 schema_text=workflow.get("schema_text"),
-            ),
-        )
+                tool_names=settings.mcp_allowed_tools,
+            )
+
+            try:
+                analysis_result_temp = await Runner.run(
+                    analysis_agent,
+                    input=conversation_history,
+                    run_config=RunConfig(
+                        trace_id=trace_id,
+                        group_id=group_id,
+                        trace_metadata=trace_metadata,
+                    ),
+                    context=AnalysisContext(
+                        workflow_input_as_text=workflow["input_as_text"],
+                        instruction_text=workflow.get("instruction_text"),
+                        schema_text=workflow.get("schema_text"),
+                    ),
+                )
+            except Exception as exc:
+                log_openai_failure(request_summary, exc)
+                raise
 
         return {
             "status": "completed",

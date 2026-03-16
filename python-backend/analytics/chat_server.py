@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 import time
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from agents import (
     ToolCallItem,
     ToolCallOutputItem,
 )
+from agents.mcp import MCPServerManager
 from chatkit.agents import AgentContext, stream_agent_response
 from chatkit.server import ChatKitServer
 from chatkit.store import NotFoundError
@@ -39,6 +41,8 @@ from analytics import (
     build_trace_identity,
     run_and_apply_guardrails,
 )
+from analytics.workflow import _build_network_mcp_server
+from analytics.workflow import log_openai_failure, log_openai_request
 from memory_store import MemoryStore
 
 
@@ -114,12 +118,17 @@ class ConversationState:
         default_factory=lambda: {
             "portal": "aristino",
             "mode": "analytics",
-            "mcp_tool": "read_query",
+            "mcp_tool": "read_data",
         }
     )
 
 
 class AnalyticsServer(ChatKitServer[dict[str, Any]]):
+    _MAX_HISTORY_ITEMS = 16
+    _MAX_MESSAGE_CHARS = 4000
+    _MAX_TOOL_OUTPUT_CHARS = 2000
+    _MAX_TOOL_ARGUMENT_CHARS = 1000
+
     def __init__(self) -> None:
         self.store = MemoryStore()
         super().__init__(self.store)
@@ -159,6 +168,85 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
         if isinstance(val, str) and len(val) > limit:
             return val[:limit] + "..."
         return val
+
+    @classmethod
+    def _truncate_for_history(cls, value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        omitted = len(value) - limit
+        return value[:limit] + f"\n...[truncated {omitted} chars]"
+
+    @classmethod
+    def _sanitize_history_value(cls, value: Any, limit: int) -> Any:
+        if isinstance(value, str):
+            return cls._truncate_for_history(value, limit)
+        if isinstance(value, list):
+            return [cls._sanitize_history_value(item, limit) for item in value]
+        if isinstance(value, dict):
+            sanitized: Dict[str, Any] = {}
+            for key, item in value.items():
+                child_limit = limit
+                if key == "output":
+                    child_limit = cls._MAX_TOOL_OUTPUT_CHARS
+                elif key == "arguments":
+                    child_limit = cls._MAX_TOOL_ARGUMENT_CHARS
+                sanitized[key] = cls._sanitize_history_value(item, child_limit)
+            return sanitized
+        return value
+
+    @classmethod
+    def _compact_input_items(cls, items: List[Any]) -> List[Any]:
+        compacted: List[Any] = []
+        for item in items:
+            if not isinstance(item, dict):
+                compacted.append(cls._sanitize_history_value(item, cls._MAX_MESSAGE_CHARS))
+                continue
+
+            item_type = item.get("type")
+            if item_type == "reasoning":
+                continue
+
+            sanitized = dict(item)
+            if "content" in sanitized:
+                sanitized["content"] = cls._sanitize_history_value(
+                    sanitized["content"],
+                    cls._MAX_MESSAGE_CHARS,
+                )
+            if "output" in sanitized:
+                sanitized["output"] = cls._sanitize_history_value(
+                    sanitized["output"],
+                    cls._MAX_TOOL_OUTPUT_CHARS,
+                )
+            if "arguments" in sanitized:
+                sanitized["arguments"] = cls._sanitize_history_value(
+                    sanitized["arguments"],
+                    cls._MAX_TOOL_ARGUMENT_CHARS,
+                )
+            if "summary" in sanitized:
+                sanitized["summary"] = cls._sanitize_history_value(
+                    sanitized["summary"],
+                    cls._MAX_MESSAGE_CHARS,
+                )
+            compacted.append(sanitized)
+
+        if len(compacted) > cls._MAX_HISTORY_ITEMS:
+            compacted = compacted[-cls._MAX_HISTORY_ITEMS :]
+        return compacted
+
+    @classmethod
+    def _build_persistent_input_items(
+        cls,
+        items: List[Any],
+        assistant_output: str | None = None,
+    ) -> List[Any]:
+        persisted: List[Any] = [
+            cls._sanitize_history_value(item, cls._MAX_MESSAGE_CHARS)
+            for item in items
+            if isinstance(item, dict) and isinstance(item.get("role"), str)
+        ]
+        if assistant_output is not None:
+            persisted.append({"role": "assistant", "content": assistant_output})
+        return cls._compact_input_items(persisted)
 
     def _build_agents_list(self, settings: AnalyticsSettings) -> List[Dict[str, Any]]:
         return [
@@ -302,6 +390,7 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
         state.context["last_user_message"] = user_text
         state.context["last_response_preview"] = self._truncate(content, 120)
         state.input_items.append({"role": "assistant", "content": content})
+        state.input_items = self._compact_input_items(state.input_items)
         await self._broadcast_state(thread, context)
         yield ClientEffectEvent(
             name="runner_state_update",
@@ -333,7 +422,7 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
         schema_override = _normalize_override(context.get("analysis_schema"))
         portal_id = _normalize_override(context.get("analysis_portal_id"))
         account_id = _normalize_override(context.get("analysis_account_id"))
-        session_key = f"{portal_id or 'default-portal'}:{account_id or 'default-account'}"
+        session_key = f"{portal_id or 'default-portal'}_{account_id or 'default-account'}"
 
         if state.session_key and state.session_key != session_key:
             state.input_items = []
@@ -342,7 +431,7 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
             state.context = {
                 "portal": "aristino",
                 "mode": "analytics",
-                "mcp_tool": "read_query",
+                "mcp_tool": "read_data",
             }
         state.session_key = session_key
 
@@ -354,6 +443,7 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
                     "content": [{"type": "input_text", "text": user_text}],
                 }
             )
+            state.input_items = self._compact_input_items(state.input_items)
             state.context["last_user_message"] = user_text
 
         state.context["instruction_configured"] = bool(instruction_override)
@@ -384,7 +474,7 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
 
         guardrails_config = build_analytics_guardrails_config(settings)
         workflow = {"input_as_text": user_text}
-        conversation_history = list(state.input_items)
+        conversation_history = self._compact_input_items(list(state.input_items))
         trace_id, group_id = build_trace_identity(portal_id, account_id)
         trace_metadata = {
             "__trace_source__": "agent-builder",
@@ -406,7 +496,7 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
                 guardrails_config=guardrails_config,
                 results=guardrails_result["results"],
             )
-            state.input_items = conversation_history
+            state.input_items = self._compact_input_items(conversation_history)
             state.context["last_safe_text"] = guardrails_result["safe_text"]
 
             if guardrails_result["has_tripwire"]:
@@ -432,62 +522,90 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
                 store=self.store,
                 request_context=context,
             )
-            result = Runner.run_streamed(
-                build_analytics_agent(settings),
-                conversation_history,
-                context=AnalysisContext(
-                    workflow_input_as_text=workflow["input_as_text"],
+            analysis_context = AnalysisContext(
+                workflow_input_as_text=workflow["input_as_text"],
+                instruction_text=instruction_override,
+                schema_text=schema_override,
+            )
+            run_config = RunConfig(
+                trace_id=trace_id,
+                group_id=group_id,
+                trace_metadata=trace_metadata,
+            )
+
+            async with AsyncExitStack() as exit_stack:
+                manager = await exit_stack.enter_async_context(
+                    MCPServerManager(
+                        [_build_network_mcp_server(settings)],
+                        strict=True,
+                    )
+                )
+                analysis_agent = build_analytics_agent(
+                    settings,
+                    mcp_servers=manager.active_servers,
+                )
+                request_summary = log_openai_request(
+                    model=settings.analysis_model,
+                    trace_id=trace_id,
+                    run_kind="streamed",
+                    input_items=conversation_history,
                     instruction_text=instruction_override,
                     schema_text=schema_override,
-                ),
-                run_config=RunConfig(
-                    trace_id=trace_id,
-                    group_id=group_id,
-                    trace_metadata=trace_metadata,
-                ),
-            )
-            async for event in stream_agent_response(chat_context, result):
-                if isinstance(event, ProgressUpdateEvent) or getattr(event, "type", "") == "progress_update_event":
-                    continue
-                if hasattr(event, "item"):
-                    run_item = getattr(event, "item")
-                    new_events = self._record_events([run_item])
-                    if new_events:
-                        state.events.extend(new_events)
-                        await self._broadcast_state(thread, context)
-                        yield ClientEffectEvent(
-                            name="runner_state_update",
-                            data={"thread_id": thread.id, "ts": time.time()},
-                        )
-                        yield ClientEffectEvent(
-                            name="runner_event_delta",
-                            data={
-                                "thread_id": thread.id,
-                                "ts": time.time(),
-                                "events": [e.model_dump() for e in new_events],
-                            },
-                        )
-                yield event
-                new_items = result.new_items[streamed_items_seen:]
-                if new_items:
-                    new_events = self._record_events(new_items)
-                    if new_events:
-                        state.events.extend(new_events)
-                    streamed_items_seen += len(new_items)
-                    await self._broadcast_state(thread, context)
-                    yield ClientEffectEvent(
-                        name="runner_state_update",
-                        data={"thread_id": thread.id, "ts": time.time()},
+                    tool_names=settings.mcp_allowed_tools,
+                )
+
+                try:
+                    result = Runner.run_streamed(
+                        analysis_agent,
+                        conversation_history,
+                        context=analysis_context,
+                        run_config=run_config,
                     )
-                    if new_events:
-                        yield ClientEffectEvent(
-                            name="runner_event_delta",
-                            data={
-                                "thread_id": thread.id,
-                                "ts": time.time(),
-                                "events": [e.model_dump() for e in new_events],
-                            },
-                        )
+                    async for event in stream_agent_response(chat_context, result):
+                        if isinstance(event, ProgressUpdateEvent) or getattr(event, "type", "") == "progress_update_event":
+                            continue
+                        if hasattr(event, "item"):
+                            run_item = getattr(event, "item")
+                            new_events = self._record_events([run_item])
+                            if new_events:
+                                state.events.extend(new_events)
+                                await self._broadcast_state(thread, context)
+                                yield ClientEffectEvent(
+                                    name="runner_state_update",
+                                    data={"thread_id": thread.id, "ts": time.time()},
+                                )
+                                yield ClientEffectEvent(
+                                    name="runner_event_delta",
+                                    data={
+                                        "thread_id": thread.id,
+                                        "ts": time.time(),
+                                        "events": [e.model_dump() for e in new_events],
+                                    },
+                                )
+                        yield event
+                        new_items = result.new_items[streamed_items_seen:]
+                        if new_items:
+                            new_events = self._record_events(new_items)
+                            if new_events:
+                                state.events.extend(new_events)
+                            streamed_items_seen += len(new_items)
+                            await self._broadcast_state(thread, context)
+                            yield ClientEffectEvent(
+                                name="runner_state_update",
+                                data={"thread_id": thread.id, "ts": time.time()},
+                            )
+                            if new_events:
+                                yield ClientEffectEvent(
+                                    name="runner_event_delta",
+                                    data={
+                                        "thread_id": thread.id,
+                                        "ts": time.time(),
+                                        "events": [e.model_dump() for e in new_events],
+                                    },
+                                )
+                except Exception as exc:
+                    log_openai_failure(request_summary, exc)
+                    raise
         except RuntimeError as exc:
             async for event in self._emit_assistant_message(
                 thread,
@@ -499,7 +617,11 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
                 yield event
             return
 
-        state.input_items = result.to_input_list()
+        final_output_text = result.final_output_as(str)
+        state.input_items = self._build_persistent_input_items(
+            conversation_history,
+            final_output_text,
+        )
         remaining_items = result.new_items[streamed_items_seen:]
         new_events = self._record_events(remaining_items)
         if new_events:
@@ -507,7 +629,7 @@ class AnalyticsServer(ChatKitServer[dict[str, Any]]):
         state.current_agent_name = "Analysis"
         try:
             state.context["last_response_preview"] = self._truncate(
-                result.final_output_as(str), 120
+                final_output_text, 120
             )
         except Exception:
             pass
